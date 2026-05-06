@@ -80,6 +80,18 @@ export const api = {
   closeTicket: (tn) => request(`/tickets/close/${tn}`, { method: 'POST' }),
   getEngineers: () => request('/auth/admin/engineers'),
   getCustomers: () => request('/auth/admin/customers'),
+  // AI / RAG endpoints
+  aiQuery: (data) => request('/ai/query', { method: 'POST', body: JSON.stringify(data) }),
+  aiSimilarTickets: (ticketNumber, data = {}) => request(`/ai/similar-tickets/${ticketNumber}`, { method: 'POST', body: JSON.stringify(data) }),
+  aiAnalyzeTrends: (data = {}) => request('/ai/analyze-trends', { method: 'POST', body: JSON.stringify(data) }),
+  aiSummarizeResolution: (ticketNumber) => request(`/ai/summarize-resolution/${ticketNumber}`, { method: 'POST' }),
+  aiLogs: (params = {}) => {
+    const qs = new URLSearchParams();
+    if (params.limit) qs.set('limit', params.limit);
+    if (params.skip) qs.set('skip', params.skip);
+    return request(`/ai/logs${qs.toString() ? '?' + qs : ''}`);
+  },
+  aiFeedback: (data) => request('/ai/feedback', { method: 'POST', body: JSON.stringify(data) }),
 };
 
 export function createChatWS(ticketId) {

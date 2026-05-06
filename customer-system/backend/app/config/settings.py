@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "ticket_support_db"
     ADMIN_BACKEND_URL: str = "http://localhost:8001"
 
+    # AI / RAG settings
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-3.5-turbo"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    EMBEDDING_CHUNK_SIZE: int = 500
+    RAG_TOP_K: int = 5
+    RAG_MAX_CONTEXT_TOKENS: int = 3000
+
     class Config:
         env_file = ".env"
 

@@ -97,6 +97,12 @@ async def create_ticket(current_user: dict, subject: str, description: str) -> d
         "messages": [system_message],
     }
     await db.tickets.insert_one(ticket_doc)
+    # Trigger async embedding (non-blocking)
+    try:
+        from app.services.embedding_service import embed_ticket
+        asyncio.create_task(embed_ticket(ticket_doc))
+    except Exception as _emb_exc:
+        logger.warning("embed_ticket task creation failed: %s", _emb_exc)
     await notification_queue.put({
         "event": WSEvent.TICKET_CREATED,
         "ticket_id": ticket_id,
