@@ -8,7 +8,9 @@ import { StatusBadge, PriorityBadge } from '../../components/StatusBadge';
 import ChatPanel from '../../components/ChatPanel';
 import NotificationPanel from '../../components/NotificationPanel';
 import Modal from '../../components/Modal';
-import { Ticket, Users, Inbox, CheckCircle, XCircle, Clock, UserPlus, RefreshCw, Search, Wifi, WifiOff, Eye } from 'lucide-react';
+import AIWidget from '../../components/AIWidget';
+import AIAnalytics from '../../components/AIAnalytics';
+import { Ticket, Users, Inbox, CheckCircle, XCircle, Clock, UserPlus, RefreshCw, Search, Wifi, WifiOff, Eye, Sparkles, BarChart2 } from 'lucide-react';
 import { format } from 'date-fns';
 
 export default function AdminDashboard() {
@@ -188,14 +190,17 @@ export default function AdminDashboard() {
           {[
             { key: 'tickets', label: 'Ticket Assignments' },
             { key: 'engineers', label: 'Engineers' },
+            { key: 'ai', label: 'Ask AI', icon: Sparkles },
+            { key: 'ai-analytics', label: 'AI Analytics', icon: BarChart2 },
           ].map(t => (
             <button
               key={t.key}
               onClick={() => { setTab(t.key); setSelected(null); }}
-              className={`px-4 py-3 text-sm font-medium transition border-b-2 ${
+              className={`flex items-center gap-1.5 px-4 py-3 text-sm font-medium transition border-b-2 ${
                 tab === t.key ? 'text-indigo-600 dark:text-indigo-400 border-indigo-600 dark:border-indigo-400' : 'text-gray-400 border-transparent hover:text-gray-600'
               }`}
             >
+              {t.icon && <t.icon size={14} />}
               {t.label}
             </button>
           ))}
@@ -348,6 +353,18 @@ export default function AdminDashboard() {
                   })}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {tab === 'ai' && (
+            <div className="flex-1 bg-white dark:bg-gray-900 overflow-hidden max-w-2xl mx-auto w-full">
+              <AIWidget />
+            </div>
+          )}
+
+          {tab === 'ai-analytics' && (
+            <div className="flex-1 overflow-hidden">
+              <AIAnalytics />
             </div>
           )}
         </div>

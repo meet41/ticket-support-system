@@ -11,3 +11,6 @@ email-validator
 pydantic[email]
 websockets
 httpx
+sentence-transformers
+openai
+numpy

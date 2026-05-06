@@ -7,6 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from datetime import datetime, timezone, timedelta
 from app.config.db import connect_to_mongo, close_mongo_connection, get_database
 from app.routes import auth_routes, ticket_routes, message_routes
+from app.routes import ai_routes
 from app.websocket.websocket_routes import router as websocket_router, manager
 from app.services.ticket_service import start_auto_resolve_loop
 
@@ -83,6 +84,7 @@ app.include_router(auth_routes.router)
 app.include_router(ticket_routes.router)
 app.include_router(message_routes.router)
 app.include_router(websocket_router)
+app.include_router(ai_routes.router)
 
 @app.get("/", tags=["Health"])
 async def root():
