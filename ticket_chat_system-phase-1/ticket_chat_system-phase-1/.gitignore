@@ -1,0 +1,69 @@
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment (your case)
+myenv/
+
+# (optional other env names if you ever use them)
+venv/
+env/
+.venv/
+
+# ----------------------
+# Environment variables
+# ----------------------
+.env
+.env.*
+
+# ----------------------
+# Logs & runtime files
+# ----------------------
+*.log
+*.pid
+*.out
+*.err
+
+# ----------------------
+# Database
+# ----------------------
+*.sqlite3
+*.db
+
+# ----------------------
+# IDE / Editor files
+# ----------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ----------------------
+# Docker
+# ----------------------
+docker-compose.override.yml
+*.tar
+
+# ----------------------
+# Node (if frontend exists)
+# ----------------------
+node_modules/
+
+# ----------------------
+# Testing
+# ----------------------
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ----------------------
+# Misc
+# ----------------------
+*.bak
+*.tmp
