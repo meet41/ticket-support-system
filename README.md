@@ -1,47 +1,63 @@
-# ticket-support-system
-Direct answer — do these edits to your existing files (no new files required). I’ll list exactly what to change, why, and give the exact code snippets you should paste into each file.
+Yes — it's feasible to avoid storing any separate session identifier in the client by using the access_token cookie itself as the pointer to the DB session row. In that approach the server:
 
-Summary of what to change
-- Fix a bug and tighten time comparisons in app/modules/auth/service.py (refresh_session, get_user_from_access_token, change_password_using_access_token return).
-- Ensure access + refresh cookies are set (and rotated) in all login/register/google flows in app/modules/auth/routes.py.
-- Keep the automatic silent refresh behavior in app/dependencies.py (it already contains logic) — small improvements suggested.
-- Make sure app/security.py properly creates/decodes tokens and returns timezone-safe expirations (I show a corrected version).
-- Add a small POST refresh endpoint in routes.py (optional because dependencies already rotates tokens on request; still useful for client JS heartbeat).
+- keeps the refresh_token only in DB (never in cookies),
+- stores only access_token (JWT) in an HttpOnly cookie (as you already do),
+- when access token is expired (or invalid), the server looks up the session row by matching the raw access_token string (from the cookie) to SessionToken.access_token in DB, checks refresh_expires_at, and rotates the session (delete old row → create new access/refresh pair) and sets the new access_token cookie.
 
-1) Fixes and improvements for app/modules/auth/service.py
-- Bug: refresh_session was checking a non-existent variable (access_token). Replace that check with refresh_token and use utc-naive comparisons consistently.
-- Use datetime.utcnow() for comparisons with DB-stored naive UTC datetimes (safer and consistent).
-- Ensure change_password_using_access_token returns the updated user at the end.
+That approach is simple to implement and avoids adding any new client-side cookie. Below I give the exact, minimal changes you should paste into your existing files to implement it, then explain the security trade-offs and the resulting flow.
 
-Replace or patch the functions below into service.py:
+What to change (copy/paste ready)
+- app/modules/auth/service.py — add refresh_session_by_access_token, fix get_user_from_access_token and change_password_using_access_token return
+- app/dependencies.py — update get_current_user to attempt server-side refresh by access_token cookie when JWT validation fails
+- app/modules/auth/routes.py — make login/register/google set only access_token cookie (no refresh cookie), keep or add a POST /auth/refresh-token endpoint that triggers the same rotation using access_token cookie (optional; useful for client heartbeat)
 
-a) get_user_from_access_token — use datetime.utcnow() comparison
+1) app/modules/auth/service.py
+Replace/patch the functions below into your service.py (keep other imports and functions). This assumes auth_repo has get_session_by_access_token, get_session_by_refresh_token, save_session, delete_session_by_id, etc. (as in your repo).
+
 ```python
-from datetime import datetime, timezone
+# app/modules/auth/service.py
+from datetime import datetime
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.auth import repository as auth_repo
+from app.modules.auth.models import Users, SessionToken
+from app.modules.auth.schemas import Register, Login, ChangePassword, GoogleUserInfo
+from app.security import (
+    validate_password,
+    hash_password,
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+)
+
+# ---------- validate access token and check DB session ----------
 async def get_user_from_access_token(
     db: AsyncSession,
     access_token: str,
 ):
+    """
+    Validate access token and DB session. Raises HTTPException on failure.
+    """
     if not access_token:
         raise HTTPException(status_code=401, detail="Access token is required")
 
     try:
         payload = decode_token(access_token)
     except Exception:
-        raise HTTPException(
-            status_code=401,
-            detail="Please login again",
-        )
+        # token decode failed (invalid or expired)
+        raise HTTPException(status_code=401, detail="Please login again")
 
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
+    # ensure DB session exists and hasn't been removed
     session = await auth_repo.get_session_by_access_token(db, access_token)
     if not session:
         raise HTTPException(status_code=401, detail="Session expired, please login again")
 
-    # session.access_expires_at is stored as a naive UTC datetime; compare with utcnow()
+    # DB datetimes are naive UTC — compare with datetime.utcnow()
     if session.access_expires_at < datetime.utcnow():
         raise HTTPException(status_code=401, detail="Access token expired, please login again")
 
@@ -50,10 +66,9 @@ async def get_user_from_access_token(
         raise HTTPException(status_code=401, detail="User not found")
 
     return user
-```
 
-b) refresh_session — fix variable name, compare with datetime.utcnow(), rotate session correctly
-```python
+
+# ---------- rotate session using a refresh token string (kept) ----------
 async def refresh_session(db: AsyncSession, refresh_token: str):
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token is required")
@@ -63,7 +78,6 @@ async def refresh_session(db: AsyncSession, refresh_token: str):
         raise HTTPException(status_code=401, detail="Session expired, please login again")
 
     if old.refresh_expires_at < datetime.utcnow():
-        # expired refresh token — delete old session
         await auth_repo.delete_session_by_id(db, old.id)
         await db.commit()
         raise HTTPException(status_code=401, detail="Refresh token expired")
@@ -78,7 +92,7 @@ async def refresh_session(db: AsyncSession, refresh_token: str):
     if user.auth_provider == "local":
         org_context = await auth_repo.get_primary_org_context(db, user.id)
 
-    # rotate session: remove old one
+    # rotate: delete old and create new session
     await auth_repo.delete_session_by_id(db, old.id)
 
     access_token, access_exp = create_access_token(user.id, org_context)
@@ -97,10 +111,61 @@ async def refresh_session(db: AsyncSession, refresh_token: str):
     await db.refresh(new_session)
 
     return new_session
-```
 
-c) change_password_using_access_token — return user
-```python
+
+# ---------- rotate session by matching the raw access_token string ----------
+async def refresh_session_by_access_token(db: AsyncSession, access_token: str):
+    """
+    Use the raw access_token cookie value to locate the DB session, validate
+    its refresh_expires_at, and rotate the session. Returns the new session row.
+    This keeps refresh_token only in DB and does not expose it to the client.
+    """
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Access token is required")
+
+    # find the DB session by access token string
+    old = await auth_repo.get_session_by_access_token(db, access_token)
+    if not old:
+        raise HTTPException(status_code=401, detail="Session not found")
+
+    # check refresh expiry in DB
+    if old.refresh_expires_at < datetime.utcnow():
+        await auth_repo.delete_session_by_id(db, old.id)
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    user = await auth_repo.get_user_by_id(db, old.user_id)
+    if not user:
+        await auth_repo.delete_session_by_id(db, old.id)
+        await db.commit()
+        raise HTTPException(status_code=401, detail="User not found")
+
+    org_context = None
+    if user.auth_provider == "local":
+        org_context = await auth_repo.get_primary_org_context(db, user.id)
+
+    # rotate: remove old session row and create a new one
+    await auth_repo.delete_session_by_id(db, old.id)
+
+    access_token_new, access_exp = create_access_token(user.id, org_context)
+    new_refresh, refresh_exp = create_refresh_token(user.id)
+
+    new_session = SessionToken(
+        user_id=user.id,
+        access_token=access_token_new,
+        refresh_token=new_refresh,
+        access_expires_at=access_exp,
+        refresh_expires_at=refresh_exp,
+    )
+
+    await auth_repo.save_session(db, new_session)
+    await db.commit()
+    await db.refresh(new_session)
+
+    return new_session
+
+
+# ---------- change password (return user) ----------
 async def change_password_using_access_token(
     db: AsyncSession,
     access_token: str,
@@ -132,26 +197,84 @@ async def change_password_using_access_token(
     await db.refresh(user)
 
     return user
+
+
+# ---------- logout helper ----------
+async def logout(
+    db: AsyncSession,
+    access_token: str | None = None,
+    session_id: int | None = None,
+):
+    if session_id:
+        await auth_repo.delete_session_by_id(db, session_id)
+        await db.commit()
+        return
+
+    if access_token:
+        await auth_repo.delete_session_by_access_token(db, access_token)
+        await db.commit()
 ```
 
-2) Ensure app/security.py is correct (token creation, decode)
-- You already posted security.py. Use a version that:
-  - Exposes create_access_token(user_id, org_context) -> (token, expiration naive UTC)
-  - create_refresh_token(user_id) -> (token, expiration naive UTC)
-  - decode_token raises ValueError for invalid / expired
-- Example (paste into security.py if needed) — the content you already have is correct after the earlier corrections. Two important notes:
-  - Return expirations as naive UTC datetimes (exp.replace(tzinfo=None)) so they compare cleanly with DB-naive datetimes.
-  - build_token_payload should include org info for access tokens.
+2) app/dependencies.py
+Replace your existing get_current_user with this (it uses only the access_token cookie; when the token is invalid/expired it calls refresh_session_by_access_token to rotate using the DB-stored refresh token):
 
-(You said you'll do changes yourself — you already have that file; just keep the corrected version.)
+```python
+# app/dependencies.py
+from fastapi import Header, HTTPException, status, Depends, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.db.parent_db import get_db
+from app.core.db.tenant_db import get_tenant_db_session
+from app.modules.organizations.models import Organizations, OrganizationMembers
+from app.modules.auth.service import get_user_from_access_token, refresh_session_by_access_token
 
-3) Modify app/modules/auth/routes.py — set refresh cookie & rotate on refresh
-- In your login/register/google flows you set only access_token cookie. Also set refresh_token cookie there.
-- Also add a POST /auth/refresh-token endpoint so client JS can proactively refresh.
+async def get_current_user(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    """
+    Return current user id or None.
+    If access token is expired/invalid, attempt to refresh using the raw access_token cookie
+    by matching it against the DB session row (which stores the refresh token).
+    """
+    access = request.cookies.get("access_token")
+    if not access:
+        return None
 
-Patch examples (replace the cookie-setting blocks in these functions):
+    # Try to validate access token normally (decoding + DB check)
+    try:
+        user = await get_user_from_access_token(db, access)
+        return user.id
+    except HTTPException:
+        # decode failed or access expired; try server-side refresh using the raw access token string
+        pass
 
-a) In google_callback — after create_login_session returns session:
+    # Attempt to refresh the session by looking up the session row using the raw access token
+    try:
+        new_session = await refresh_session_by_access_token(db, access)
+    except Exception:
+        return None
+
+    # Validate the newly created access token and fetch user
+    try:
+        user = await get_user_from_access_token(db, new_session.access_token)
+    except Exception:
+        return None
+
+    # Set the rotated access token cookie (we never expose refresh_token to client)
+    response.set_cookie(
+        key="access_token",
+        value=new_session.access_token,
+        httponly=True,
+        path="/",
+        samesite="lax",
+        # secure=True  # enable in production
+    )
+
+    return user.id
+```
+
+3) app/modules/auth/routes.py
+Set only the access_token cookie at login/register/google (do not set refresh_token cookie). Also add (optional) POST /auth/refresh-token endpoint that rotates using access_token cookie (this is useful if your client wants to proactively keep the session alive).
+
+- Replace cookie-setting blocks after successful login/register/google with:
+
 ```python
 res.set_cookie(
     key="access_token",
@@ -159,159 +282,102 @@ res.set_cookie(
     httponly=True,
     path="/",
     samesite="lax",
+    # secure=True  # enable in production
 )
-res.set_cookie(
-    key="refresh_token",
-    value=session.refresh_token,
-    httponly=True,
-    path="/",
-    samesite="lax",
-)
+# DO NOT set refresh_token cookie or session_id cookie
 ```
 
-b) In register_submit, same cookies:
-```python
-res.set_cookie(
-    key="access_token",
-    value=session.access_token,
-    httponly=True,
-    path="/",
-    samesite="lax",
-)
-res.set_cookie(
-    key="refresh_token",
-    value=session.refresh_token,
-    httponly=True,
-    path="/",
-    samesite="lax",
-)
-```
+- Add a refresh endpoint (optional):
 
-c) In login_submit, same cookies:
-```python
-res.set_cookie(
-    key="access_token",
-    value=session.access_token,
-    httponly=True,
-    path="/",
-    samesite="lax",
-)
-res.set_cookie(
-    key="refresh_token",
-    value=session.refresh_token,
-    httponly=True,
-    path="/",
-    samesite="lax",
-)
-```
-
-d) Add a refresh endpoint (optional but convenient) at the bottom of routes.py:
 ```python
 from fastapi.responses import JSONResponse
 from fastapi import HTTPException
 
 @auth_router.post("/auth/refresh-token")
 async def refresh_token_endpoint(request: Request, db: AsyncSession = Depends(get_db)):
-    refresh_token = request.cookies.get("refresh_token")
-    if not refresh_token:
-        raise HTTPException(status_code=401, detail="Refresh token missing")
+    """
+    Proactively rotate session using the raw access_token cookie (server-side refresh token in DB).
+    Client should call this with credentials included; the server will rotate and set a new access cookie.
+    """
+    access_cookie = request.cookies.get("access_token")
+    if not access_cookie:
+        raise HTTPException(status_code=401, detail="Access token not found")
 
     try:
-        session = await auth_service.refresh_session(db, refresh_token)
+        new_session = await auth_service.refresh_session_by_access_token(db, access_cookie)
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    response = JSONResponse({"status": "ok"})
-    response.set_cookie(key="access_token", value=session.access_token, httponly=True, path="/", samesite="lax")
-    response.set_cookie(key="refresh_token", value=session.refresh_token, httponly=True, path="/", samesite="lax")
-    return response
+    resp = JSONResponse({"status": "ok"})
+    resp.set_cookie(key="access_token", value=new_session.access_token, httponly=True, path="/", samesite="lax")
+    return resp
 ```
 
-4) app/dependencies.py — your get_current_user already attempts silent refresh
-- You already implemented the behavior: when get_user_from_access_token fails, it reads refresh_token cookie, calls refresh_session and then sets cookies on the Response return.
-- Suggested improvements (not required but recommended):
-  - Use datetime.utcnow() in service checks (done above).
-  - When you set cookies on response, set SameSite and Secure if running on HTTPS:
-    response.set_cookie(key="access_token", value=session.access_token, httponly=True, secure=True, samesite="lax", path="/")
-    response.set_cookie(key="refresh_token", value=session.refresh_token, httponly=True, secure=True, samesite="lax", path="/")
+Also update logout to delete the DB session row by access_token cookie when present:
 
-Your get_current_user currently:
 ```python
-async def get_current_user(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+@auth_router.post("/auth/logout")
+async def logout_submit(request: Request, db: AsyncSession = Depends(get_db)):
     access = request.cookies.get("access_token")
-    if not access:
-        return None
-
     try:
-        user = await get_user_from_access_token(db, access)
-        return user.id
-    except HTTPException:
+        if access:
+            await auth_service.logout(db, access_token=access)
+    except Exception:
         pass
 
-    refresh = request.cookies.get("refresh_token")
-    if not refresh:
-        return None
-    try:
-        session = await refresh_session(db, refresh)
-    except Exception:
-        return None
-    try:
-        user = await get_user_from_access_token(db, session.access_token)
-    except Exception:
-        return None
-    response.set_cookie(key="access_token", value=session.access_token, httponly=True, path="/")
-    response.set_cookie(key="refresh_token", value=session.refresh_token, httponly=True, path="/")
-    return user.id
+    res = RedirectResponse(url="/auth/login?msg=Logged out successfully", status_code=303)
+    res.delete_cookie("access_token", path="/")
+    return res
 ```
-- This is fine; just consider adding secure=True in production and samesite and an expiry value (expires or max_age).
 
-5) Important notes and deployment checklist
-- DB session token fields: Your models store access_expires_at and refresh_expires_at as DateTime (naive). Ensure you store the expiration datetimes as naive UTC when creating sessions (the security.create_* functions use .replace(tzinfo=None) — good).
-- Cookie security:
-  - In production set secure=True (only send over HTTPS).
-  - httponly=True (already set) to prevent JS reads.
-  - samesite="lax" or "strict" by policy.
-  - If you want JS to proactively call /auth/refresh-token, do NOT set HttpOnly on refresh cookie; but that is less secure. Better approach: keep both cookies httponly and rely on middleware/deps to refresh on next request or send POST refresh request and let browser include cookies (credentials: include). Browser will still send HttpOnly cookies with fetch when credentials: 'include' is set.
-- Client-side proactive refresh:
-  - If you want the browser to proactively refresh (so no user-visible 401 occurs even when idle), add a small JS heartbeat calling POST /auth/refresh-token every N minutes (e.g., every 13 minutes). Use fetch with credentials: 'include'.
-- Logout behavior:
-  - logout() already deletes session by access token and you already delete cookies in routes.logout. Ensure you also remove session rows associated with user when user logs out from all devices (you already have delete_all_user_sessions).
+(If you still keep other logout behaviors, keep them consistent — ensure DB session row is deleted.)
 
-6) Minimal optional JavaScript to proactively refresh (paste into base template)
-```html
-<script>
-async function refreshTokenHeartbeat() {
-  try {
-    const res = await fetch('/auth/refresh-token', {
-      method: 'POST',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      // refresh failed — redirect to login
-      window.location.href = '/auth/login?error=Session+expired';
-    }
-  } catch (err) {
-    console.error('Heart refresh failed', err);
-  }
-}
-// every 13 minutes
-setInterval(refreshTokenHeartbeat, 13 * 60 * 1000);
-</script>
-```
-Note: because cookies are httpOnly, fetch will still include them if credentials: 'include' is set. No need to expose refresh token to JS.
+Flow after these changes
+- Login/register/google:
+  - Server creates a SessionToken DB row with access_token (JWT), refresh_token (secret), expiry timestamps; returns access_token in HttpOnly cookie only (no refresh cookie).
+- On each request:
+  - get_current_user tries to decode and validate access token and checks DB row exists and not expired → if OK, request proceeds.
+  - If decode fails or access expired, get_current_user calls refresh_session_by_access_token(db, raw_access_cookie):
+    - server finds the DB session by matching the raw access_token string,
+    - verifies refresh_expires_at,
+    - deletes old row and creates new session row (new access_token + new refresh_token),
+    - returns new_session to caller,
+    - get_current_user sets a new access_token cookie and returns the user.
+- Logout:
+  - server deletes DB session row (by access_token) and removes access cookie.
 
-7) Tests to run locally after changes
-- Register via web flow: verify both access_token and refresh_token cookies are set.
-- Wait > ACCESS_TOKEN_MINUTES, perform an authenticated page load → should still work because get_current_user will rotate token and set new cookies.
-- Call POST /auth/refresh-token with cookies included and verify cookies are rotated.
-- Logout and verify session removed from DB and cookies deleted.
-- Change password and ensure all sessions invalidated (users logged out).
+Security trade-offs and mitigations (short summary)
+- Similar to any cookie-based approach: whoever obtains the access_token cookie can both access resources (until access_expires_at) and, if access token still present, can trigger refresh to get a new access token (until refresh_expires_at) — because the raw cookie is used to find the session row in DB for rotation.
+- Pros of this approach:
+  - No extra session identifier cookie; implementation is minimal.
+  - Refresh token itself never leaves DB.
+  - Simpler client: only one cookie to manage (access_token).
+- Cons / risks:
+  - If an attacker steals the access_token cookie (via XSS or other means), they can use it to refresh and get a new access token. That risk exists for any cookie or token the client holds.
+  - If the DB is compromised with write access, the attacker can tamper with session rows — unavoidable with DB compromise.
+- Mitigations (recommended):
+  - Keep cookies HttpOnly and Secure (HTTPS) and SameSite to reduce XSS/CSRF exposure.
+  - Rotate sessions on refresh (we already delete old row and create new one).
+  - Short access_token lifetime (15 minutes) and reasonable refresh lifetime (e.g., 30 days).
+  - Optionally record metadata in the SessionToken row (user_agent, IP) and validate on refresh to reduce risk of stolen cookie reuse from other devices/locations.
+  - Rate-limit refresh endpoints and audit refresh events.
+  - On critical actions (password change, email change), delete_all_user_sessions to force re-login.
 
-Implementation plan (in order)
-1. Update service.py functions (get_user_from_access_token, refresh_session, change_password_using_access_token).
-2. Update routes.py to set both cookies in login/register/google_callback and add the refresh endpoint.
-3. (Optional) Update templates to include JS heartbeat.
-4. Run local tests described above.
-5. Add secure=True to cookies in production.
+Is this the best option?
+- It's a good, pragmatic option if you want to avoid any additional cookie and keep refresh_token server-only. It is simpler than the "session_key hash" approach and reduces the number of moving parts.
+- If you want a stronger containment of refresh capability in case a cookie is stolen, the session_key-hash approach (store a random token in cookie and only the hash in DB) is slightly stronger against DB leaks (DB only contains hashes). But both approaches still expose a client-side secret (access_token cookie vs session_key cookie) that can be stolen by XSS.
+- If you want maximum protection from stolen cookies, you need more advanced measures: short refresh lifetimes, device binding, re-auth for sensitive operations, refresh proofs (PKCE-like), or storing refresh tokens in a secure client storage using secure channels (not feasible for server-rendered web apps).
 
-If you want, I can produce exact file diffs/patches for each file (copy-paste ready). Which files would you like the full patch for now (service.py, routes.py, dependencies.py, security.py)?
+Concluding recommendation
+- If you prefer minimal change and to avoid storing any session ID cookie: implement the changes above (refresh by access_token DB lookup). It will meet your requirement: refresh_token only in DB and access token gets rotated/kept alive transparently.
+- Additionally implement these hardening steps:
+  - set cookies with secure=True in production,
+  - add user_agent and optionally IP checks in SessionToken,
+  - log/monitor refresh calls and failed refresh attempts,
+  - invalidate all sessions on password change.
+
+If you want, I can now produce:
+- a) exact full-file patches (copy-paste ready) for service.py, dependencies.py and routes.py implementing the refresh-by-access-token approach; OR
+- b) the alternative stronger session_key_hash implementation that stores a hashed random session key in DB and plaintext in cookie (more protection in DB leak scenarios).
+
+Which do you want me to generate now — (a) minimal access_token-based patches or (b) session_key_hash-based patches?
